@@ -1,5 +1,7 @@
 #pragma once
 #include <d3d12.h>
+#include <mutex>
+#include <vector>
 #include "logger.h"
 
 struct ResourceRange {
@@ -11,9 +13,15 @@ struct ResourceRange {
 extern D3D12_VERTEX_BUFFER_VIEW lastVBView;
 extern D3D12_INDEX_BUFFER_VIEW lastIBView;
 extern std::vector<ResourceRange> g_Resources;
+extern std::mutex g_resourcesMutex;
+
+void RegisterBufferResource(void* ppvResource, UINT64 width, D3D12_RESOURCE_DIMENSION dim);
 
 class WrappedCommandList : public ID3D12GraphicsCommandList {
 public:
+    D3D12_VERTEX_BUFFER_VIEW m_currentVB = {};
+    D3D12_INDEX_BUFFER_VIEW m_currentIB = {};
+
     WrappedCommandList(ID3D12GraphicsCommandList* real) : m_real(real) {}
     virtual ~WrappedCommandList() {}
 
@@ -25,6 +33,8 @@ public:
     // ID3D12GraphicsCommandList
     HRESULT STDMETHODCALLTYPE Close() override { return m_real->Close(); }
     HRESULT STDMETHODCALLTYPE Reset(ID3D12CommandAllocator* pAllocator, ID3D12PipelineState* pInitialState) override {
+        m_currentVB = {};
+        m_currentIB = {};
         return m_real->Reset(pAllocator, pInitialState);
     }
     void STDMETHODCALLTYPE DrawInstanced(UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation, UINT StartInstanceLocation) override;

@@ -1,8 +1,10 @@
 #include <Windows.h>
 #include <d3d12.h>
+#include <mutex>
 #include "dllmain.h"
 #include "logger.h"
 #include "WrappedDevice.h"
+#include "OverlayUI.h"
 
 extern "C" void call_original(void);
 extern "C" FARPROC wrapPtr = NULL;
@@ -70,6 +72,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
         case DLL_PROCESS_DETACH: 
         {
             Logger::LogInfo() << "DLL PROCESS DETACH - Successfully" << std::endl;
+            StopCompanionGUI();
             Logger::Shutdown();
 
             FreeLibrary(d3d12dll);
@@ -103,6 +106,11 @@ HRESULT Wrap_D3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL MinimumFeat
     if (ppDevice != nullptr) {
         WrappedD3D12Device* wrapped = new WrappedD3D12Device((ID3D12Device*)*ppDevice);
         *ppDevice = (ID3D12Device10*)wrapped;
+
+        static std::once_flag g_guiInitFlag;
+        std::call_once(g_guiInitFlag, []() {
+            StartCompanionGUI();
+        });
     }
 
     if (FAILED(original))

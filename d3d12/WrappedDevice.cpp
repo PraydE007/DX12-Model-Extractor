@@ -468,52 +468,9 @@ HRESULT __stdcall WrappedD3D12Device::CreateCommittedResource(
 		pHeapProperties, HeapFlags, pDesc, InitialResourceState,
 		pOptimizedClearValue, riidResource, ppvResource);
 
-	if (FAILED(hr)) {
-		Logger::LogError() << "[CreateCommittedResource] Call failed with HRESULT: 0x"
-			<< std::hex << hr;
-		return hr;
-	}
-
-	if (!*ppvResource) {
-		Logger::LogError() << "[CreateCommittedResource] Resource was not created (nullptr)!";
-		return E_FAIL;
-	}
-
-	if (pDesc && pDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+	if (SUCCEEDED(hr) && ppvResource && *ppvResource && pDesc)
 	{
-		IUnknown* unk = reinterpret_cast<IUnknown*>(*ppvResource);
-
-		if (!unk) {
-			Logger::LogError() << "[CreateCommittedResource] reinterpret_cast to IUnknown failed!";
-			return hr;
-		}
-
-		ID3D12Resource* res = nullptr;
-		HRESULT qhr = unk->QueryInterface(IID_PPV_ARGS(&res));
-		if (FAILED(qhr)) {
-			Logger::LogWarning() << "[CreateCommittedResource] QueryInterface(ID3D12Resource) failed, HRESULT: 0x"
-				<< std::hex << qhr;
-			return hr;
-		}
-
-		if (res)
-		{
-			D3D12_GPU_VIRTUAL_ADDRESS gpuAddr = res->GetGPUVirtualAddress();
-
-			ResourceRange entry = {
-				.base = gpuAddr,
-				.size = static_cast<UINT>(pDesc->Width),
-				.resource = res
-			};
-
-			g_Resources.push_back(entry);
-
-			Logger::LogInfo() << "[CreateCommittedResource] Added resource @ 0x"
-				<< std::hex << gpuAddr
-				<< " size: " << std::dec << pDesc->Width;
-
-			res->Release();
-		}
+		RegisterBufferResource(*ppvResource, pDesc->Width, pDesc->Dimension);
 	}
 
 	return hr;
@@ -526,12 +483,22 @@ HRESULT __stdcall WrappedD3D12Device::CreateHeap(const D3D12_HEAP_DESC* pDesc, R
 
 HRESULT __stdcall WrappedD3D12Device::CreatePlacedResource(ID3D12Heap* pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riid, void** ppvResource)
 {
-	return m_device->CreatePlacedResource(pHeap, HeapOffset, pDesc, InitialState, pOptimizedClearValue, riid, ppvResource);
+	HRESULT hr = m_device->CreatePlacedResource(pHeap, HeapOffset, pDesc, InitialState, pOptimizedClearValue, riid, ppvResource);
+	if (SUCCEEDED(hr) && ppvResource && *ppvResource && pDesc)
+	{
+		RegisterBufferResource(*ppvResource, pDesc->Width, pDesc->Dimension);
+	}
+	return hr;
 }
 
 HRESULT __stdcall WrappedD3D12Device::CreateReservedResource(const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riid, void** ppvResource)
 {
-	return m_device->CreateReservedResource(pDesc, InitialState, pOptimizedClearValue, riid, ppvResource);
+	HRESULT hr = m_device->CreateReservedResource(pDesc, InitialState, pOptimizedClearValue, riid, ppvResource);
+	if (SUCCEEDED(hr) && ppvResource && *ppvResource && pDesc)
+	{
+		RegisterBufferResource(*ppvResource, pDesc->Width, pDesc->Dimension);
+	}
+	return hr;
 }
 
 HRESULT __stdcall WrappedD3D12Device::CreateSharedHandle(ID3D12DeviceChild* pObject, const SECURITY_ATTRIBUTES* pAttributes, DWORD Access, LPCWSTR Name, HANDLE* pHandle)
@@ -646,7 +613,12 @@ HRESULT __stdcall WrappedD3D12Device::CreateProtectedResourceSession(const D3D12
 
 HRESULT __stdcall WrappedD3D12Device::CreateCommittedResource1(const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialResourceState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, ID3D12ProtectedResourceSession* pProtectedSession, REFIID riidResource, void** ppvResource)
 {
-	return m_device4->CreateCommittedResource1(pHeapProperties, HeapFlags, pDesc, InitialResourceState, pOptimizedClearValue, pProtectedSession, riidResource, ppvResource);
+	HRESULT hr = m_device4->CreateCommittedResource1(pHeapProperties, HeapFlags, pDesc, InitialResourceState, pOptimizedClearValue, pProtectedSession, riidResource, ppvResource);
+	if (SUCCEEDED(hr) && ppvResource && *ppvResource && pDesc)
+	{
+		RegisterBufferResource(*ppvResource, pDesc->Width, pDesc->Dimension);
+	}
+	return hr;
 }
 
 HRESULT __stdcall WrappedD3D12Device::CreateHeap1(const D3D12_HEAP_DESC* pDesc, ID3D12ProtectedResourceSession* pProtectedSession, REFIID riid, void** ppvHeap)
@@ -656,7 +628,12 @@ HRESULT __stdcall WrappedD3D12Device::CreateHeap1(const D3D12_HEAP_DESC* pDesc, 
 
 HRESULT __stdcall WrappedD3D12Device::CreateReservedResource1(const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, ID3D12ProtectedResourceSession* pProtectedSession, REFIID riid, void** ppvResource)
 {
-	return m_device4->CreateReservedResource1(pDesc, InitialState, pOptimizedClearValue, pProtectedSession, riid, ppvResource);
+	HRESULT hr = m_device4->CreateReservedResource1(pDesc, InitialState, pOptimizedClearValue, pProtectedSession, riid, ppvResource);
+	if (SUCCEEDED(hr) && ppvResource && *ppvResource && pDesc)
+	{
+		RegisterBufferResource(*ppvResource, pDesc->Width, pDesc->Dimension);
+	}
+	return hr;
 }
 
 D3D12_RESOURCE_ALLOCATION_INFO __stdcall WrappedD3D12Device::GetResourceAllocationInfo1(UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs, D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1)
@@ -726,12 +703,22 @@ D3D12_RESOURCE_ALLOCATION_INFO __stdcall WrappedD3D12Device::GetResourceAllocati
 
 HRESULT __stdcall WrappedD3D12Device::CreateCommittedResource2(const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC1* pDesc, D3D12_RESOURCE_STATES InitialResourceState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, ID3D12ProtectedResourceSession* pProtectedSession, REFIID riidResource, void** ppvResource)
 {
-	return m_device8->CreateCommittedResource2(pHeapProperties, HeapFlags, pDesc, InitialResourceState, pOptimizedClearValue, pProtectedSession, riidResource, ppvResource);
+	HRESULT hr = m_device8->CreateCommittedResource2(pHeapProperties, HeapFlags, pDesc, InitialResourceState, pOptimizedClearValue, pProtectedSession, riidResource, ppvResource);
+	if (SUCCEEDED(hr) && ppvResource && *ppvResource && pDesc)
+	{
+		RegisterBufferResource(*ppvResource, pDesc->Width, pDesc->Dimension);
+	}
+	return hr;
 }
 
 HRESULT __stdcall WrappedD3D12Device::CreatePlacedResource1(ID3D12Heap* pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC1* pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riid, void** ppvResource)
 {
-	return m_device8->CreatePlacedResource1(pHeap, HeapOffset, pDesc, InitialState, pOptimizedClearValue, riid, ppvResource);
+	HRESULT hr = m_device8->CreatePlacedResource1(pHeap, HeapOffset, pDesc, InitialState, pOptimizedClearValue, riid, ppvResource);
+	if (SUCCEEDED(hr) && ppvResource && *ppvResource && pDesc)
+	{
+		RegisterBufferResource(*ppvResource, pDesc->Width, pDesc->Dimension);
+	}
+	return hr;
 }
 
 void __stdcall WrappedD3D12Device::CreateSamplerFeedbackUnorderedAccessView(ID3D12Resource* pTargetedResource, ID3D12Resource* pFeedbackResource, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor)
@@ -761,15 +748,30 @@ HRESULT __stdcall WrappedD3D12Device::CreateCommandQueue1(const D3D12_COMMAND_QU
 
 HRESULT __stdcall WrappedD3D12Device::CreateCommittedResource3(const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC1* pDesc, D3D12_BARRIER_LAYOUT InitialLayout, const D3D12_CLEAR_VALUE* pOptimizedClearValue, ID3D12ProtectedResourceSession* pProtectedSession, UINT32 NumCastableFormats, const DXGI_FORMAT* pCastableFormats, REFIID riidResource, void** ppvResource) 
 {
-	return m_device10->CreateCommittedResource3(pHeapProperties, HeapFlags, pDesc, InitialLayout, pOptimizedClearValue, pProtectedSession, NumCastableFormats, pCastableFormats, riidResource, ppvResource); 
+	HRESULT hr = m_device10->CreateCommittedResource3(pHeapProperties, HeapFlags, pDesc, InitialLayout, pOptimizedClearValue, pProtectedSession, NumCastableFormats, pCastableFormats, riidResource, ppvResource); 
+	if (SUCCEEDED(hr) && ppvResource && *ppvResource && pDesc)
+	{
+		RegisterBufferResource(*ppvResource, pDesc->Width, pDesc->Dimension);
+	}
+	return hr;
 }
 
 HRESULT __stdcall WrappedD3D12Device::CreatePlacedResource2(ID3D12Heap* pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC1* pDesc, D3D12_BARRIER_LAYOUT InitialLayout, const D3D12_CLEAR_VALUE* pOptimizedClearValue, UINT32 NumCastableFormats, const DXGI_FORMAT* pCastableFormats, REFIID riid, void** ppvResource) 
 { 
-	return m_device10->CreatePlacedResource2(pHeap, HeapOffset, pDesc, InitialLayout, pOptimizedClearValue, NumCastableFormats, pCastableFormats, riid, ppvResource); 
+	HRESULT hr = m_device10->CreatePlacedResource2(pHeap, HeapOffset, pDesc, InitialLayout, pOptimizedClearValue, NumCastableFormats, pCastableFormats, riid, ppvResource); 
+	if (SUCCEEDED(hr) && ppvResource && *ppvResource && pDesc)
+	{
+		RegisterBufferResource(*ppvResource, pDesc->Width, pDesc->Dimension);
+	}
+	return hr;
 }
 
 HRESULT __stdcall WrappedD3D12Device::CreateReservedResource2(const D3D12_RESOURCE_DESC* pDesc, D3D12_BARRIER_LAYOUT InitialLayout, const D3D12_CLEAR_VALUE* pOptimizedClearValue, ID3D12ProtectedResourceSession* pProtectedSession, UINT32 NumCastableFormats, const DXGI_FORMAT* pCastableFormats, REFIID riid, void** ppvResource) 
 {
-	return m_device10->CreateReservedResource2(pDesc, InitialLayout, pOptimizedClearValue, pProtectedSession, NumCastableFormats, pCastableFormats, riid, ppvResource); 
+	HRESULT hr = m_device10->CreateReservedResource2(pDesc, InitialLayout, pOptimizedClearValue, pProtectedSession, NumCastableFormats, pCastableFormats, riid, ppvResource); 
+	if (SUCCEEDED(hr) && ppvResource && *ppvResource && pDesc)
+	{
+		RegisterBufferResource(*ppvResource, pDesc->Width, pDesc->Dimension);
+	}
+	return hr;
 }

@@ -1,16 +1,62 @@
-﻿#include "WrappedCommandList.h"
+#include "WrappedCommandList.h"
 #include "WrappedDevice.h"
 #include "ObjectExporter.h"
+#include "OverlayUI.h"
 #include "d3dx12.h"
 #include <d3d12.h>
 #include <chrono>
+#include <mutex>
 
 D3D12_VERTEX_BUFFER_VIEW lastVBView = {};
 D3D12_INDEX_BUFFER_VIEW lastIBView = {};
 std::vector<ResourceRange> g_Resources;
+std::mutex g_resourcesMutex;
 
-static bool wasPressed = false;
 static std::unordered_set<size_t> g_exportedHashes;
+static std::mutex g_hashesMutex;
+
+// ── Multi-mesh accumulator ────────────────────────────────────────────────────
+static std::vector<SubMeshCapture> g_pendingSubMeshes;
+static std::mutex                  g_pendingMutex;
+
+void ResetExportedHashes() {
+    std::lock_guard<std::mutex> lock(g_hashesMutex);
+    g_exportedHashes.clear();
+    Logger::LogInfo() << "[ObjectExporter] Reset hashes.";
+}
+
+void RegisterBufferResource(void* ppvResource, UINT64 width, D3D12_RESOURCE_DIMENSION dim)
+{
+    if (!ppvResource || dim != D3D12_RESOURCE_DIMENSION_BUFFER)
+        return;
+
+    IUnknown* unk = reinterpret_cast<IUnknown*>(ppvResource);
+    if (!unk) return;
+
+    ID3D12Resource* res = nullptr;
+    if (SUCCEEDED(unk->QueryInterface(IID_PPV_ARGS(&res))) && res)
+    {
+        D3D12_GPU_VIRTUAL_ADDRESS gpuAddr = res->GetGPUVirtualAddress();
+        if (gpuAddr != 0)
+        {
+            ResourceRange entry = {
+                .base = gpuAddr,
+                .size = width,
+                .resource = res
+            };
+
+            {
+                std::lock_guard<std::mutex> lock(g_resourcesMutex);
+                g_Resources.push_back(entry);
+            }
+
+            Logger::LogInfo() << "[RegisterResource] Added buffer @ 0x"
+                << std::hex << gpuAddr
+                << " size: " << std::dec << width;
+        }
+        res->Release();
+    }
+}
 
 void STDMETHODCALLTYPE WrappedCommandList::DrawInstanced(
     UINT VertexCountPerInstance,
@@ -18,98 +64,128 @@ void STDMETHODCALLTYPE WrappedCommandList::DrawInstanced(
     UINT StartVertexLocation,
     UINT StartInstanceLocation)
 {
-    SHORT keyState = GetAsyncKeyState('0');
-    static bool was9Pressed = false;
-    bool isPressed = (keyState & 0x8000) != 0;
+    SHORT keyState0 = GetAsyncKeyState('0');
+    static bool was0Pressed = false;
+    bool is0Pressed = (keyState0 & 0x8000) != 0;
 
-    if (isPressed && !was9Pressed)
+    SHORT keyStateN = GetAsyncKeyState('N');
+    bool isNPressed = (keyStateN & 0x8000) != 0;
+    static bool wasNPressed = false;
+
+    SHORT keyStateC = GetAsyncKeyState('C');
+    bool isCPressed = (keyStateC & 0x8000) != 0;
+    static bool wasCPressed = false;
+
+    bool manualCapture = (is0Pressed && !was0Pressed) || (isNPressed && !wasNPressed) || (isCPressed && !wasCPressed) || g_CaptureTriggered.load();
+    was0Pressed = is0Pressed;
+    wasNPressed = isNPressed;
+    wasCPressed = isCPressed;
+
+    bool shouldExport = manualCapture || g_AutoExport.load();
+
+    if (!shouldExport)
     {
-        ID3D12Device* device = nullptr;
-        if (SUCCEEDED(m_real->GetDevice(__uuidof(ID3D12Device), (void**)&device)) && device)
+        m_real->DrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+        return;
+    }
+
+    D3D12_VERTEX_BUFFER_VIEW vbView = (m_currentVB.BufferLocation != 0 && m_currentVB.BufferLocation != ~0ull) ? m_currentVB : lastVBView;
+    if (vbView.BufferLocation == 0 || vbView.BufferLocation == ~0ull)
+    {
+        m_real->DrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+        return;
+    }
+
+    ID3D12Device* device = nullptr;
+    if (SUCCEEDED(m_real->GetDevice(__uuidof(ID3D12Device), (void**)&device)) && device)
+    {
+        ID3D12Resource* vbRes = nullptr;
         {
-            ID3D12Resource* vbRes = nullptr;
+            std::lock_guard<std::mutex> lock(g_resourcesMutex);
             for (const auto& entry : g_Resources)
             {
-                if (lastVBView.BufferLocation >= entry.base &&
-                    lastVBView.BufferLocation < entry.base + entry.size)
+                if (vbView.BufferLocation >= entry.base &&
+                    vbView.BufferLocation < entry.base + entry.size)
                 {
                     vbRes = entry.resource;
                     break;
                 }
             }
+        }
 
-            if (vbRes)
+        if (vbRes)
+        {
+            UINT64 vbOffset = vbView.BufferLocation - vbRes->GetGPUVirtualAddress();
+            UINT vbSize = vbView.SizeInBytes;
+
+            UINT minFilter = (UINT)g_FromFilter.load();
+            UINT maxFilter = (UINT)g_ToFilter.load();
+            if (minFilter < (UINT)kMinSaveSize) minFilter = (UINT)kMinSaveSize;
+
+            if (vbSize >= minFilter && vbSize <= maxFilter &&
+                vbOffset + vbSize <= vbRes->GetDesc().Width)
             {
-                UINT64 vbOffset = lastVBView.BufferLocation - vbRes->GetGPUVirtualAddress();
-                UINT vbSize = lastVBView.SizeInBytes;
+                CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_READBACK);
+                CD3DX12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Buffer(vbSize);
 
-                if (vbSize >= kMinSaveSize && vbSize <= kMaxSaveSize &&
-                    vbOffset + vbSize <= vbRes->GetDesc().Width)
+                ID3D12Resource* vbReadback = nullptr;
+                if (SUCCEEDED(device->CreateCommittedResource(
+                    &heapProps,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    nullptr,
+                    IID_PPV_ARGS(&vbReadback))))
                 {
-                    CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_READBACK);
-                    CD3DX12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Buffer(vbSize);
+                    ID3D12CommandAllocator* alloc = nullptr;
+                    ID3D12GraphicsCommandList* cmdList = nullptr;
+                    ID3D12CommandQueue* queue = nullptr;
+                    ID3D12Fence* fence = nullptr;
+                    HANDLE fenceEvent = nullptr;
 
-                    ID3D12Resource* vbReadback = nullptr;
-                    if (SUCCEEDED(device->CreateCommittedResource(
-                        &heapProps,
-                        D3D12_HEAP_FLAG_NONE,
-                        &desc,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        nullptr,
-                        IID_PPV_ARGS(&vbReadback))))
+                    if (SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) &&
+                        SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cmdList))))
                     {
-                        ID3D12CommandAllocator* alloc = nullptr;
-                        ID3D12GraphicsCommandList* cmdList = nullptr;
-                        ID3D12CommandQueue* queue = nullptr;
-                        ID3D12Fence* fence = nullptr;
-                        HANDLE fenceEvent = nullptr;
+                        auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+                            vbRes, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        cmdList->ResourceBarrier(1, &barrier);
+                        cmdList->CopyBufferRegion(vbReadback, 0, vbRes, vbOffset, vbSize);
+                        cmdList->Close();
 
-                        if (SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) &&
-                            SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cmdList))))
+                        D3D12_COMMAND_QUEUE_DESC qdesc = {};
+                        qdesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+                        if (SUCCEEDED(device->CreateCommandQueue(&qdesc, IID_PPV_ARGS(&queue))) &&
+                            SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
                         {
-                            auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-                                vbRes, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                            cmdList->ResourceBarrier(1, &barrier);
-                            cmdList->CopyBufferRegion(vbReadback, 0, vbRes, vbOffset, vbSize);
-                            cmdList->Close();
+                            fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+                            queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)&cmdList);
+                            queue->Signal(fence, 1);
+                            fence->SetEventOnCompletion(1, fenceEvent);
+                            WaitForSingleObject(fenceEvent, INFINITE);
 
-                            D3D12_COMMAND_QUEUE_DESC qdesc = {};
-                            qdesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-                            if (SUCCEEDED(device->CreateCommandQueue(&qdesc, IID_PPV_ARGS(&queue))) &&
-                                SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
+                            void* vbData = nullptr;
+                            if (SUCCEEDED(vbReadback->Map(0, nullptr, &vbData)))
                             {
-                                fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-                                queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)&cmdList);
-                                queue->Signal(fence, 1);
-                                fence->SetEventOnCompletion(1, fenceEvent);
-                                WaitForSingleObject(fenceEvent, INFINITE);
-
-                                void* vbData = nullptr;
-                                if (SUCCEEDED(vbReadback->Map(0, nullptr, &vbData)))
-                                {
-                                    RunAsyncExport(vbData, vbSize, lastVBView.StrideInBytes, nullptr, 0, DXGI_FORMAT_UNKNOWN);
-                                    vbReadback->Unmap(0, nullptr);
-                                }
-
-                                CloseHandle(fenceEvent);
-                                fence->Release();
-                                queue->Release();
+                                RunAsyncExport(vbData, vbSize, vbView.StrideInBytes, nullptr, 0, DXGI_FORMAT_UNKNOWN);
+                                vbReadback->Unmap(0, nullptr);
                             }
 
-                            cmdList->Release();
-                            alloc->Release();
+                            CloseHandle(fenceEvent);
+                            fence->Release();
+                            queue->Release();
                         }
 
-                        vbReadback->Release();
+                        cmdList->Release();
+                        alloc->Release();
                     }
+
+                    vbReadback->Release();
                 }
             }
-
-            device->Release();
         }
-    }
 
-    was9Pressed = isPressed;
+        device->Release();
+    }
 
     m_real->DrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
 }
@@ -122,9 +198,8 @@ void STDMETHODCALLTYPE WrappedCommandList::DrawIndexedInstanced(
     UINT StartInstanceLocation)
 {
     static bool g_deviceLost = false;
-    static bool wasPressed = false;
     static std::chrono::steady_clock::time_point lastSaveTime = std::chrono::steady_clock::now();
-    const std::chrono::milliseconds kMinInterval(420);
+    const std::chrono::milliseconds kMinInterval(200);
 
     if (g_deviceLost)
     {
@@ -132,10 +207,57 @@ void STDMETHODCALLTYPE WrappedCommandList::DrawIndexedInstanced(
         return;
     }
 
+    SHORT keyStateN = GetAsyncKeyState('N');
+    bool isNPressed = (keyStateN & 0x8000) != 0;
+    static bool wasNPressed = false;
+
+    SHORT keyStateC = GetAsyncKeyState('C');
+    bool isCPressed = (keyStateC & 0x8000) != 0;
+    static bool wasCPressed = false;
+
+    bool manualCapture = (isNPressed && !wasNPressed) || (isCPressed && !wasCPressed) || g_CaptureTriggered.exchange(false);
+    wasNPressed = isNPressed;
+    wasCPressed = isCPressed;
+
+    bool shouldExport = manualCapture || g_AutoExport.load();
+
+    // Fast path: if not capturing, execute and return immediately with 0 overhead
+    if (!shouldExport)
+    {
+        m_real->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+        return;
+    }
+
+    D3D12_VERTEX_BUFFER_VIEW vbView = (m_currentVB.BufferLocation != 0 && m_currentVB.BufferLocation != ~0ull) ? m_currentVB : lastVBView;
+    D3D12_INDEX_BUFFER_VIEW ibView  = (m_currentIB.BufferLocation != 0 && m_currentIB.BufferLocation != ~0ull) ? m_currentIB : lastIBView;
+
+    if (vbView.BufferLocation == 0 || vbView.BufferLocation == ~0ull ||
+        ibView.BufferLocation == 0 || ibView.BufferLocation == ~0ull)
+    {
+        m_real->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+        return;
+    }
+
+    // ── Throttle only in stream/AutoExport mode ──────────────────────────────
+    // In manual-capture mode we must NOT throttle: all sub-meshes of a single
+    // model are drawn in the same frame and must all pass through.
+    if (!manualCapture && g_AutoExport.load())
+    {
+        auto now = std::chrono::steady_clock::now();
+        if (now - lastSaveTime < kMinInterval)
+        {
+            m_real->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+            return;
+        }
+        lastSaveTime = now;
+    }
+    if (manualCapture)
+        lastSaveTime = std::chrono::steady_clock::now(); // reset for next auto-export session
+
     ID3D12Device* device = nullptr;
     if (FAILED(m_real->GetDevice(__uuidof(ID3D12Device), (void**)&device)) || !device)
     {
-        Logger::LogError() << "[DrawIndexedInstanced] Failed to get ID3D12Device.";
+        m_real->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
         return;
     }
 
@@ -144,198 +266,297 @@ void STDMETHODCALLTYPE WrappedCommandList::DrawIndexedInstanced(
         Logger::LogError() << "[DrawIndexedInstanced] Device was removed.";
         g_deviceLost = true;
         device->Release();
-        return;
-    }
-
-    if (lastVBView.BufferLocation == 0 || lastVBView.BufferLocation == ~0ull ||
-        lastIBView.BufferLocation == 0 || lastIBView.BufferLocation == ~0ull)
-    {
-        Logger::LogError() << "[DrawIndexedInstanced] Invalid buffer locations.";
-        device->Release();
         m_real->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
         return;
     }
 
     ID3D12Resource* vbResource = nullptr;
     ID3D12Resource* ibResource = nullptr;
-    for (const auto& entry : g_Resources)
     {
-        if (!vbResource && lastVBView.BufferLocation >= entry.base && lastVBView.BufferLocation < entry.base + entry.size)
-            vbResource = entry.resource;
-        if (!ibResource && lastIBView.BufferLocation >= entry.base && lastIBView.BufferLocation < entry.base + entry.size)
-            ibResource = entry.resource;
-        if (vbResource && ibResource) break;
+        std::lock_guard<std::mutex> lock(g_resourcesMutex);
+        for (const auto& entry : g_Resources)
+        {
+            if (!vbResource && vbView.BufferLocation >= entry.base && vbView.BufferLocation < entry.base + entry.size)
+                vbResource = entry.resource;
+            if (!ibResource && ibView.BufferLocation >= entry.base && ibView.BufferLocation < entry.base + entry.size)
+                ibResource = entry.resource;
+            if (vbResource && ibResource) break;
+        }
     }
 
-    SHORT keyState = GetAsyncKeyState('N');
-    bool isPressed = (keyState & 0x8000) != 0;
-
-    if (isPressed)
+    if (!vbResource || !ibResource)
     {
-        auto now = std::chrono::steady_clock::now();
-        if (now - lastSaveTime < kMinInterval)
-            goto CleanupAndDraw;
+        Logger::LogWarning() << "[DrawIndexedInstanced] Buffers not found for VB@0x"
+            << std::hex << vbView.BufferLocation << " IB@0x" << ibView.BufferLocation << std::dec;
+        device->Release();
+        m_real->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+        return;
+    }
 
-        lastSaveTime = now;
+    UINT64 vbOffset = vbView.BufferLocation - vbResource->GetGPUVirtualAddress();
+    UINT64 ibOffset = ibView.BufferLocation - ibResource->GetGPUVirtualAddress();
+    UINT vbSize = vbView.SizeInBytes;
+    UINT ibSize = ibView.SizeInBytes;
 
-        if (!vbResource || !ibResource)
+    UINT minFilter = (UINT)g_FromFilter.load();
+    UINT maxFilter = (UINT)g_ToFilter.load();
+    if (minFilter < (UINT)kMinSaveSize) minFilter = (UINT)kMinSaveSize;
+
+    if (vbSize < minFilter || ibSize < minFilter)
+    {
+        device->Release();
+        m_real->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+        return;
+    }
+    if (vbSize > maxFilter || ibSize > maxFilter)
+    {
+        device->Release();
+        m_real->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+        return;
+    }
+
+    auto vbDesc = vbResource->GetDesc();
+    auto ibDesc = ibResource->GetDesc();
+    if (vbOffset + vbSize > vbDesc.Width || ibOffset + ibSize > ibDesc.Width)
+    {
+        Logger::LogError() << "[DrawIndexedInstanced] Readback exceeds resource bounds.";
+        device->Release();
+        m_real->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+        return;
+    }
+
+    // ── Draw-call-parameter hash ─────────────────────────────────────────────
+    // Use draw-call params (NOT full buffer content) so that sub-meshes sharing
+    // the same VB/IB buffer are each treated as a unique capture entry.
+    size_t drawHash = 14695981039346656037ull;
+    auto hashCombine = [&](auto v) {
+        drawHash ^= std::hash<decltype(v)>{}(v);
+        drawHash *= 1099511628211ull;
+    };
+    hashCombine(vbView.BufferLocation);
+    hashCombine(ibView.BufferLocation);
+    hashCombine((UINT64)StartIndexLocation);
+    hashCombine((UINT64)(UINT)BaseVertexLocation);
+    hashCombine((UINT64)IndexCountPerInstance);
+
+    // ── Skip-submesh logic ───────────────────────────────────────────────────
+    // s_skipCounter counts qualifying draw calls per capture session.
+    // It resets to 0 whenever manualCapture fires (new session begins).
+    // When Skip Submeshes is enabled, the first N draws are skipped.
+    static int s_skipCounter = 0;
+    if (manualCapture)
+        s_skipCounter = 0; // new session — restart counter
+
+    if (g_SkipSubmeshes.load())
+    {
+        int skipN = g_SkipSubmeshCount.load();
+        if (s_skipCounter < skipN)
         {
-            Logger::LogWarning() << "[DrawIndexedInstanced] Buffers not found.";
-            goto CleanupAndDraw;
+            ++s_skipCounter;
+            Logger::LogInfo() << "[DrawIndexedInstanced] Skip-submesh: skipping draw #"
+                << s_skipCounter << " of " << skipN;
+            device->Release();
+            m_real->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+            return;
         }
+    }
+    ++s_skipCounter;
 
-        UINT64 vbOffset = lastVBView.BufferLocation - vbResource->GetGPUVirtualAddress();
-        UINT64 ibOffset = lastIBView.BufferLocation - ibResource->GetGPUVirtualAddress();
-        UINT vbSize = lastVBView.SizeInBytes;
-        UINT ibSize = lastIBView.SizeInBytes;
-
-        if (vbSize < kMinSaveSize || ibSize < kMinSaveSize)
+    // ── Duplicate-draw check ─────────────────────────────────────────────────
+    {
+        std::lock_guard<std::mutex> lock(g_hashesMutex);
+        if (!g_exportedHashes.insert(drawHash).second)
         {
-            Logger::LogInfo() << "[DrawIndexedInstanced] Skipped: buffer too small.";
-            goto CleanupAndDraw;
+            Logger::LogInfo() << "[DrawIndexedInstanced] Skipped duplicate draw (startIdx="
+                << StartIndexLocation << ").";
+            device->Release();
+            m_real->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+            return;
         }
-        if (vbSize > kMaxSaveSize || ibSize > kMaxSaveSize)
+    }
+
+    // ── GPU readback ─────────────────────────────────────────────────────────
+    ID3D12Resource* vbReadback = nullptr;
+    ID3D12Resource* ibReadback = nullptr;
+    ID3D12CommandAllocator* allocator = nullptr;
+    ID3D12GraphicsCommandList* cmdList = nullptr;
+    ID3D12CommandQueue* queue = nullptr;
+    ID3D12Fence* fence = nullptr;
+    HANDLE fenceEvent = nullptr;
+    bool success = true;
+
+    CD3DX12_HEAP_PROPERTIES readbackHeap(D3D12_HEAP_TYPE_READBACK);
+    CD3DX12_RESOURCE_DESC vbDescBuffer = CD3DX12_RESOURCE_DESC::Buffer(vbSize);
+    CD3DX12_RESOURCE_DESC ibDescBuffer = CD3DX12_RESOURCE_DESC::Buffer(ibSize);
+
+    if (FAILED(device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &vbDescBuffer,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&vbReadback))))
+    {
+        Logger::LogError() << "[DrawIndexedInstanced] Failed to create vbReadback.";
+        success = false;
+    }
+
+    if (success && FAILED(device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &ibDescBuffer,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&ibReadback))))
+    {
+        Logger::LogError() << "[DrawIndexedInstanced] Failed to create ibReadback.";
+        success = false;
+    }
+
+    if (success && FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))))
+    {
+        Logger::LogError() << "[DrawIndexedInstanced] Failed to create command allocator.";
+        success = false;
+    }
+
+    if (success && FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, IID_PPV_ARGS(&cmdList))))
+    {
+        Logger::LogError() << "[DrawIndexedInstanced] Failed to create command list.";
+        success = false;
+    }
+
+    if (success)
+    {
+        CD3DX12_RESOURCE_BARRIER barriers[2] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(vbResource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(ibResource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)
+        };
+        cmdList->ResourceBarrier(2, barriers);
+        cmdList->CopyBufferRegion(vbReadback, 0, vbResource, vbOffset, vbSize);
+        cmdList->CopyBufferRegion(ibReadback, 0, ibResource, ibOffset, ibSize);
+        cmdList->Close();
+    }
+
+    D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (success && FAILED(device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue))))
+    {
+        Logger::LogError() << "[DrawIndexedInstanced] Failed to create command queue.";
+        success = false;
+    }
+
+    if (success && FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
+    {
+        Logger::LogError() << "[DrawIndexedInstanced] Failed to create fence.";
+        success = false;
+    }
+
+    if (success)
+    {
+        fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        if (!fenceEvent)
         {
-            Logger::LogWarning() << "[DrawIndexedInstanced] Skipped: buffer too large.";
-            goto CleanupAndDraw;
-        }
-
-        auto vbDesc = vbResource->GetDesc();
-        auto ibDesc = ibResource->GetDesc();
-        if (vbOffset + vbSize > vbDesc.Width || ibOffset + ibSize > ibDesc.Width)
-        {
-            Logger::LogError() << "[DrawIndexedInstanced] Readback exceeds resource bounds.";
-            goto CleanupAndDraw;
-        }
-
-        ID3D12Resource* vbReadback = nullptr;
-        ID3D12Resource* ibReadback = nullptr;
-        ID3D12CommandAllocator* allocator = nullptr;
-        ID3D12GraphicsCommandList* cmdList = nullptr;
-        ID3D12CommandQueue* queue = nullptr;
-        ID3D12Fence* fence = nullptr;
-        HANDLE fenceEvent = nullptr;
-        bool success = true;
-
-        CD3DX12_HEAP_PROPERTIES readbackHeap(D3D12_HEAP_TYPE_READBACK);
-        CD3DX12_RESOURCE_DESC vbDescBuffer = CD3DX12_RESOURCE_DESC::Buffer(vbSize);
-        CD3DX12_RESOURCE_DESC ibDescBuffer = CD3DX12_RESOURCE_DESC::Buffer(ibSize);
-
-        if (FAILED(device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &vbDescBuffer,
-            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&vbReadback))))
-        {
-            Logger::LogError() << "[DrawIndexedInstanced] Failed to create vbReadback.";
+            Logger::LogError() << "[DrawIndexedInstanced] Failed to create fence event.";
             success = false;
         }
+    }
 
-        if (success && FAILED(device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &ibDescBuffer,
-            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&ibReadback))))
-        {
-            Logger::LogError() << "[DrawIndexedInstanced] Failed to create ibReadback.";
-            success = false;
-        }
+    if (success)
+    {
+        queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)&cmdList);
+        queue->Signal(fence, 1);
+        fence->SetEventOnCompletion(1, fenceEvent);
+        WaitForSingleObject(fenceEvent, INFINITE);
+    }
 
-        if (success && FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))))
-        {
-            Logger::LogError() << "[DrawIndexedInstanced] Failed to create command allocator.";
-            success = false;
-        }
+    if (success && device->GetDeviceRemovedReason() != S_OK)
+    {
+        Logger::LogError() << "[DrawIndexedInstanced] Device lost during readback.";
+        g_deviceLost = true;
+        success = false;
+    }
 
-        if (success && FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, IID_PPV_ARGS(&cmdList))))
-        {
-            Logger::LogError() << "[DrawIndexedInstanced] Failed to create command list.";
-            success = false;
-        }
+    if (success)
+    {
+        void* vbData = nullptr;
+        void* ibData = nullptr;
 
-        if (success)
+        if (SUCCEEDED(vbReadback->Map(0, nullptr, &vbData)) &&
+            SUCCEEDED(ibReadback->Map(0, nullptr, &ibData)))
         {
-            CD3DX12_RESOURCE_BARRIER vbBarrier = CD3DX12_RESOURCE_BARRIER::Transition(vbResource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            CD3DX12_RESOURCE_BARRIER ibBarrier = CD3DX12_RESOURCE_BARRIER::Transition(ibResource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            cmdList->ResourceBarrier(1, &vbBarrier);
-            cmdList->ResourceBarrier(1, &ibBarrier);
-            cmdList->CopyBufferRegion(vbReadback, 0, vbResource, vbOffset, vbSize);
-            cmdList->CopyBufferRegion(ibReadback, 0, ibResource, ibOffset, ibSize);
-            cmdList->Close();
-        }
-
-        D3D12_COMMAND_QUEUE_DESC queueDesc = {};
-        queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        if (success && FAILED(device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue))))
-        {
-            Logger::LogError() << "[DrawIndexedInstanced] Failed to create command queue.";
-            success = false;
-        }
-
-        if (success && FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
-        {
-            Logger::LogError() << "[DrawIndexedInstanced] Failed to create fence.";
-            success = false;
-        }
-
-        if (success)
-        {
-            fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-            if (!fenceEvent)
+            if (g_MultiMeshExport.load())
             {
-                Logger::LogError() << "[DrawIndexedInstanced] Failed to create fence event.";
-                success = false;
-            }
-        }
+                // ── Multi-mesh accumulation mode ─────────────────────────────
+                SubMeshCapture cap;
+                cap.vbData                = std::vector<char>((char*)vbData, (char*)vbData + vbSize);
+                cap.ibData                = std::vector<char>((char*)ibData, (char*)ibData + ibSize);
+                cap.stride                = vbView.StrideInBytes;
+                cap.ibFormat              = ibView.Format;
+                cap.startIndexLocation    = StartIndexLocation;
+                cap.baseVertexLocation    = BaseVertexLocation;
+                cap.indexCountPerInstance = IndexCountPerInstance;
 
-        if (success)
-        {
-            queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)&cmdList);
-            queue->Signal(fence, 1);
-            fence->SetEventOnCompletion(1, fenceEvent);
-            WaitForSingleObject(fenceEvent, INFINITE);
-        }
-
-        if (success && device->GetDeviceRemovedReason() != S_OK)
-        {
-            Logger::LogError() << "[DrawIndexedInstanced] Device lost during readback.";
-            g_deviceLost = true;
-            success = false;
-        }
-
-        if (success)
-        {
-            void* vbData = nullptr;
-            void* ibData = nullptr;
-
-            if (SUCCEEDED(vbReadback->Map(0, nullptr, &vbData)) &&
-                SUCCEEDED(ibReadback->Map(0, nullptr, &ibData)))
-            {
-                size_t hash = HashBuffers(vbData, vbSize, ibData, ibSize);
-                if (g_exportedHashes.find(hash) != g_exportedHashes.end())
+                std::vector<SubMeshCapture> toExport;
                 {
-                    Logger::LogInfo() << "[DrawIndexedInstanced] Skipped duplicate mesh.";
+                    std::lock_guard<std::mutex> lock(g_pendingMutex);
+                    g_pendingSubMeshes.push_back(std::move(cap));
+
+                    bool shouldFlush = false;
+                    if (g_SubMeshCountEnabled.load())
+                    {
+                        // Flush when we have collected exactly the requested number
+                        shouldFlush = ((int)g_pendingSubMeshes.size() >= g_SubMeshCount.load());
+                    }
+                    else
+                    {
+                        // Without a fixed count: flush on manual capture trigger only
+                        shouldFlush = manualCapture;
+                    }
+
+                    if (shouldFlush)
+                    {
+                        toExport = std::move(g_pendingSubMeshes);
+                        g_pendingSubMeshes.clear();
+                    }
+                }
+
+                // Reset hashes outside the pending lock to avoid nested lock ordering
+                if (!toExport.empty())
+                {
+                    {
+                        std::lock_guard<std::mutex> hlock(g_hashesMutex);
+                        g_exportedHashes.clear();
+                    }
+                    Logger::LogInfo() << "[MultiMesh] Flushing " << toExport.size() << " sub-mesh(es).";
+                    RunAsyncMultiMeshExport(std::move(toExport));
                 }
                 else
                 {
-                    Logger::LogInfo() << "[DrawIndexedInstanced] Readback success. vb=" << vbData << ", ib=" << ibData;
-                    g_exportedHashes.insert(hash);
-                    RunAsyncExport(vbData, vbSize, lastVBView.StrideInBytes, ibData, ibSize, lastIBView.Format);
+                    size_t pendingCount;
+                    { std::lock_guard<std::mutex> lock(g_pendingMutex); pendingCount = g_pendingSubMeshes.size(); }
+                    Logger::LogInfo() << "[MultiMesh] Accumulated sub-mesh #"
+                        << pendingCount
+                        << " (startIdx=" << StartIndexLocation
+                        << ", baseVtx=" << BaseVertexLocation
+                        << ", idxCount=" << IndexCountPerInstance << ")";
                 }
-                vbReadback->Unmap(0, nullptr);
-                ibReadback->Unmap(0, nullptr);
             }
             else
             {
-                Logger::LogError() << "[DrawIndexedInstanced] Failed to map readback buffers.";
+                // ── Normal single-mesh mode ──────────────────────────────────
+                Logger::LogInfo() << "[DrawIndexedInstanced] Readback OK. startIdx=" << StartIndexLocation
+                    << " baseVtx=" << BaseVertexLocation << " idxCount=" << IndexCountPerInstance;
+                RunAsyncExport(vbData, vbSize, vbView.StrideInBytes, ibData, ibSize, ibView.Format,
+                    StartIndexLocation, BaseVertexLocation, IndexCountPerInstance);
             }
-        }
 
-        if (fenceEvent) CloseHandle(fenceEvent);
-        if (fence) fence->Release();
-        if (queue) queue->Release();
-        if (cmdList) cmdList->Release();
-        if (allocator) allocator->Release();
-        if (vbReadback) vbReadback->Release();
-        if (ibReadback) ibReadback->Release();
+            vbReadback->Unmap(0, nullptr);
+            ibReadback->Unmap(0, nullptr);
+        }
+        else
+        {
+            Logger::LogError() << "[DrawIndexedInstanced] Failed to map readback buffers.";
+        }
     }
 
-CleanupAndDraw:
-    wasPressed = isPressed;
+    if (fenceEvent) CloseHandle(fenceEvent);
+    if (fence) fence->Release();
+    if (queue) queue->Release();
+    if (cmdList) cmdList->Release();
+    if (allocator) allocator->Release();
+    if (vbReadback) vbReadback->Release();
+    if (ibReadback) ibReadback->Release();
+
     device->Release();
     m_real->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 }
@@ -476,16 +697,17 @@ void STDMETHODCALLTYPE WrappedCommandList::ExecuteIndirect(
                 continue;
             }
 
-            CD3DX12_RESOURCE_BARRIER vbBarrier = CD3DX12_RESOURCE_BARRIER::Transition(vbRes, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            CD3DX12_RESOURCE_BARRIER ibBarrier = CD3DX12_RESOURCE_BARRIER::Transition(ibRes, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            cmd2->ResourceBarrier(1, &vbBarrier);
-            cmd2->ResourceBarrier(1, &ibBarrier);
+            CD3DX12_RESOURCE_BARRIER barriers2[2] = {
+                CD3DX12_RESOURCE_BARRIER::Transition(vbRes, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                CD3DX12_RESOURCE_BARRIER::Transition(ibRes, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)
+            };
+            cmd2->ResourceBarrier(2, barriers2);
             cmd2->CopyBufferRegion(vbReadback, 0, vbRes, vbOffset, vbSize);
             cmd2->CopyBufferRegion(ibReadback, 0, ibRes, ibOffset, ibSize);
             cmd2->Close();
 
             queue->ExecuteCommandLists(1, (ID3D12CommandList* const*)&cmd2);
-            fence->Signal(2);
+            queue->Signal(fence, 2);
             fence->SetEventOnCompletion(2, fenceEvent);
             WaitForSingleObject(fenceEvent, INFINITE);
 
@@ -496,10 +718,15 @@ void STDMETHODCALLTYPE WrappedCommandList::ExecuteIndirect(
                 SUCCEEDED(ibReadback->Map(0, nullptr, &ibData)))
             {
                 size_t hash = HashBuffers(vbData, vbSize, ibData, ibSize);
-                if (g_exportedHashes.find(hash) == g_exportedHashes.end())
+                bool isDuplicate = false;
                 {
-                    g_exportedHashes.insert(hash);
-                    RunAsyncExport(vbData, vbSize, lastVBView.StrideInBytes, ibData, ibSize, lastIBView.Format);
+                    std::lock_guard<std::mutex> hlock(g_hashesMutex);
+                    isDuplicate = !g_exportedHashes.insert(hash).second;
+                }
+                if (!isDuplicate)
+                {
+                    RunAsyncExport(vbData, vbSize, lastVBView.StrideInBytes, ibData, ibSize, lastIBView.Format,
+                        a.StartIndexLocation, a.BaseVertexLocation, a.IndexCountPerInstance);
                 }
                 vbReadback->Unmap(0, nullptr);
                 ibReadback->Unmap(0, nullptr);
@@ -514,8 +741,6 @@ void STDMETHODCALLTYPE WrappedCommandList::ExecuteIndirect(
         readback->Unmap(0, nullptr);
     }
 
-    wasMPressed = isMDown;
-
     CloseHandle(fenceEvent);
     fence->Release();
     queue->Release();
@@ -527,21 +752,24 @@ void STDMETHODCALLTYPE WrappedCommandList::ExecuteIndirect(
 
 void STDMETHODCALLTYPE WrappedCommandList::IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* pView) {
     if (pView) {
+        m_currentIB = *pView;
         lastIBView = *pView;
-        /*Logger::LogInfo() << "BufferLocation: " << lastIBView.BufferLocation << std::endl;
-        Logger::LogInfo() << "SizeInBytes: " << lastIBView.SizeInBytes << std::endl;
-        Logger::LogInfo() << "Format: " << lastIBView.Format << std::endl;*/
+    } else {
+        m_currentIB = {};
     }
 
     m_real->IASetIndexBuffer(pView);
 }
 
 void STDMETHODCALLTYPE WrappedCommandList::IASetVertexBuffers(UINT StartSlot, UINT NumViews, const D3D12_VERTEX_BUFFER_VIEW* pViews) {
-    if (StartSlot == 0 && NumViews > 0) {
-        lastVBView = pViews[0];
-        /*Logger::LogInfo() << "BufferLocation: " << lastVBView.BufferLocation << std::endl;
-        Logger::LogInfo() << "SizeInBytes: " << lastVBView.SizeInBytes << std::endl;
-        Logger::LogInfo() << "Format: " << lastVBView.StrideInBytes << std::endl;*/
+    if (pViews && NumViews > 0) {
+        for (UINT i = 0; i < NumViews; ++i) {
+            if (pViews[i].BufferLocation != 0 && pViews[i].StrideInBytes >= sizeof(float) * 3) {
+                m_currentVB = pViews[i];
+                lastVBView = pViews[i];
+                break;
+            }
+        }
     }
 
     m_real->IASetVertexBuffers(StartSlot, NumViews, pViews);
@@ -553,7 +781,6 @@ void STDMETHODCALLTYPE WrappedCommandList::SetGraphicsRootShaderResourceView(UIN
     for (const auto& entry : g_Resources) {
         if (BufferLocation >= entry.base && BufferLocation < entry.base + entry.size) {
             Logger::LogInfo() << "Matched resource: " << entry.resource;
-            
         }
     }
 
